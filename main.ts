@@ -1,8 +1,8 @@
-// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 4, 9 and 10 of SPEC.md: the command line, the output and
-// exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. The other three formats are
-// detected and then read as holding no edit, so they answer `error: parse 1`: reading unified diffs (section 6),
-// SEARCH/REPLACE blocks (section 7) and V4A patches (section 8), and matching lines at three tiers (section 5), are
-// yours to write. Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
+// main.ts is mend, the CLI SPEC.md specifies. It does sections 1 to 5, 7, 9 and 10 of SPEC.md: the command line, the output and
+// exit codes, safe paths, format detection, three-tier line matching, SEARCH/REPLACE blocks, JSON edits and the
+// all-or-nothing write. Reading unified diffs (section 6) and V4A patches (section 8) is still to come: those formats
+// are detected and then read as holding no edit, so they answer `error: parse 1`. Node 22, the standard library alone;
+// run it as `node main.ts [options] [PATCH]`.
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
@@ -38,6 +38,92 @@ function patchLines(text: string): string[] {
 
 function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+}
+
+/** A file split at its own line break: its lines, the break, and whether it ends with one. */
+interface FileParts {
+  lines: string[];
+  br: string;
+  finalBr: boolean;
+}
+
+function splitFile(text: string): FileParts {
+  if (text === '') return { lines: [], br: '\n', finalBr: false };
+  const nl = text.indexOf('\n');
+  const br = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+  const lines = text.split(br);
+  let finalBr = false;
+  if (text.endsWith(br)) {
+    lines.pop();
+    finalBr = true;
+  }
+  return { lines, br, finalBr };
+}
+
+function joinFile(lines: string[], br: string, finalBr: boolean): string {
+  if (lines.length === 0) return '';
+  return lines.join(br) + (finalBr ? br : '');
+}
+
+const trailWS = (s: string): string => s.replace(/[ \t]+$/, '');
+const bothWS = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+const leadWS = (s: string): string => {
+  const m = /^[ \t]*/.exec(s);
+  return m ? m[0] : '';
+};
+
+/** The key a line is compared by at a tier (SPEC.md section 5). */
+function tierKey(line: string, tier: number): string {
+  if (tier === 0) return line;
+  if (tier === 1) return trailWS(line);
+  return bothWS(line);
+}
+
+/** Every 0-based position where oldLines occur in lines at this tier; occurrences may overlap. */
+function occurrences(lines: string[], oldLines: string[], tier: number): number[] {
+  const out: number[] = [];
+  const k = oldLines.length;
+  if (k === 0 || k > lines.length) return out;
+  const keys = oldLines.map((l) => tierKey(l, tier));
+  for (let i = 0; i + k <= lines.length; i += 1) {
+    let ok = true;
+    for (let j = 0; j < k; j += 1) {
+      if (tierKey(lines[i + j]!, tier) !== keys[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+/** The first tier at which oldLines occur at least once, with its positions; null when none do. */
+function findTier(lines: string[], oldLines: string[], strict: boolean): { tier: number; occ: number[] } | null {
+  const tiers = strict ? [0] : [0, 1, 2];
+  for (const t of tiers) {
+    const occ = occurrences(lines, oldLines, t);
+    if (occ.length > 0) return { tier: t, occ };
+  }
+  return null;
+}
+
+/** Tier 2 re-indentation of one new line: its leading P (from O's first line) replaced by F (from the file's first matched line). */
+function reindentLine(line: string, f: string, p: string): string {
+  if (!/[^ \t]/.test(line)) return line;
+  if (line.startsWith(p)) return f + line.slice(p.length);
+  return line;
+}
+
+function reindentLines(nw: string[], f: string, p: string): string[] {
+  return nw.map((l) => reindentLine(l, f, p));
+}
+
+/** Replace oldLen lines at pos of before with nw, keeping before's break and final break. */
+function applyReplace(before: string, pos: number, oldLen: number, nw: string[]): string {
+  const parts = splitFile(before);
+  const out = [...parts.lines.slice(0, pos), ...nw, ...parts.lines.slice(pos + oldLen)];
+  return joinFile(out, parts.br, parts.finalBr);
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -164,6 +250,73 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
+/** SEARCH/REPLACE blocks (SPEC.md section 7), each block one edit, applied in order. */
+function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let prevPath: string | null = null;
+  let boundary = 0;
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') {
+      i += 1;
+      continue;
+    }
+    const searchLine = i + 1;
+    let path: string | null = null;
+    for (let j = i - 1; j >= boundary; j -= 1) {
+      const t = lines[j]!.trim();
+      if (t === '' || t.startsWith('```')) continue;
+      path = t;
+      break;
+    }
+    if (path === null) {
+      if (prevPath === null) throw new Exit2(`error: parse ${searchLine}`);
+      path = prevPath;
+    }
+    let sep = -1;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j]!.trimEnd() === '=======') {
+        sep = j;
+        break;
+      }
+    }
+    let end = -1;
+    if (sep >= 0) {
+      for (let j = sep + 1; j < lines.length; j += 1) {
+        if (lines[j]!.trimEnd() === '>>>>>>> REPLACE') {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (sep < 0 || end < 0) throw new Exit2(`error: parse ${searchLine}`);
+    const oldLines = lines.slice(i + 1, sep);
+    const newLines = lines.slice(sep + 1, end);
+    const p = path;
+    edits.push((tree) => {
+      if (!safe(p)) throw new Fail('unsafe', p);
+      if (oldLines.length === 0) {
+        if (tree.get(p) !== null) throw new Fail('exists', p);
+        tree.now.set(p, newLines.length === 0 ? '' : `${newLines.join('\n')}\n`);
+        return;
+      }
+      const before = tree.get(p);
+      if (before === null) throw new Fail('missing', p);
+      const parts = splitFile(before);
+      const found = findTier(parts.lines, oldLines, strict);
+      if (found === null) throw new Fail('no-match', p);
+      if (found.occ.length > 1) throw new Fail('ambiguous', p);
+      const pos = found.occ[0]!;
+      const nw = found.tier === 2 ? reindentLines(newLines, leadWS(parts.lines[pos]!), leadWS(oldLines[0]!)) : newLines;
+      tree.now.set(p, applyReplace(before, pos, oldLines.length, nw));
+    });
+    prevPath = p;
+    boundary = end + 1;
+    i = end + 1;
+  }
+  return edits;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -192,7 +345,9 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
+    if (kind === 'json') edits = jsonEdits(text, lines);
+    else if (kind === 'search-replace') edits = searchReplaceEdits(lines, strict);
+    else edits = [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
